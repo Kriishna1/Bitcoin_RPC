@@ -29,6 +29,7 @@ def compute_merkle_root(txids: list) -> str:
     """
     Compute the Merkle root from a list of txids (hex strings).
     Each txid is converted into little-endian bytes for hashing.
+    Returns the final hash in big-endian hex.
     """
     hashes = [bytes.fromhex(txid)[::-1] for txid in txids]
     if len(hashes) == 0:
@@ -40,7 +41,6 @@ def compute_merkle_root(txids: list) -> str:
         for i in range(0, len(hashes), 2):
             new_hashes.append(double_sha256(hashes[i] + hashes[i+1]))
         hashes = new_hashes
-    # Return final hash in big-endian hex
     return hashes[0][::-1].hex()
 
 # -----------------------------
@@ -59,7 +59,7 @@ def create_coinbase_tx() -> (str, str):
           * Output 1: block reward (50 BTC) with a simple output script (OP_1)
           * Output 2: witness commitment output (OP_RETURN with a 36-byte payload,
             which is 4-byte header "aa21a9ed" followed by 32 zero bytes)
-      - Witness: one witness element whose length is 0 (reserved value)
+      - Witness: one witness element of length 32 (32 bytes of zeros).
       - locktime = 0
     The coinbase txid is computed from the non-witness serialization.
     """
@@ -99,7 +99,7 @@ def create_coinbase_tx() -> (str, str):
     # Locktime (4 bytes)
     locktime = (0).to_bytes(4, 'little')
 
-    # Witness: one element with 0-length (the reserved value)
+    # Witness: one element with length 32 containing 32 zero bytes.
     witness = varint(1) + varint(32) + (b'\x00' * 32)
 
     # Full segwit coinbase transaction serialization:
@@ -114,8 +114,7 @@ def create_coinbase_tx() -> (str, str):
 # Process Mempool Transactions
 # -----------------------------
 # Read all JSON files from the mempool folder.
-# IMPORTANT: Ensure that each file in the mempool folder is named exactly "<txid>.json"
-# (for example, "00000964b698b728022e6d180add7b2c060676e522ab2907f06198af7b2d0b99.json")
+# IMPORTANT: Each file in the mempool folder should be named "<txid>.json"
 mempool_dir = 'mempool'
 mempool_txids = []
 for filename in os.listdir(mempool_dir):
@@ -130,11 +129,43 @@ for filename in os.listdir(mempool_dir):
             continue
 
 # -----------------------------
+# Limit Mempool Transactions by Maximum Block Weight
+# -----------------------------
+# We define the maximum block weight as 4,000,000 weight units.
+MAX_BLOCK_WEIGHT = 4000000
+
+# Compute coinbase weight as the byte-size of its serialized transaction (a proxy for weight).
+coinbase_serialized, coinbase_txid = create_coinbase_tx()
+coinbase_weight = len(coinbase_serialized) // 2
+
+total_weight = coinbase_weight
+selected_mempool_txids = []
+
+# For each mempool transaction, read its JSON (which must include a "weight" field)
+# and only include it if adding its weight keeps total weight <= MAX_BLOCK_WEIGHT.
+for txid in mempool_txids:
+    tx_path = os.path.join(mempool_dir, f"{txid}.json")
+    if os.path.exists(tx_path):
+        try:
+            with open(tx_path, 'r') as f:
+                tx_json = json.load(f)
+                tx_weight = int(tx_json.get("weight", 0))
+                if total_weight + tx_weight <= MAX_BLOCK_WEIGHT:
+                    total_weight += tx_weight
+                    selected_mempool_txids.append(txid)
+                else:
+                    # Skip this transaction to avoid exceeding the weight limit.
+                    continue
+        except Exception:
+            continue
+
+# -----------------------------
 # Create Coinbase Transaction and Compute Merkle Root
 # -----------------------------
+# Recreate coinbase transaction (in case needed)
 coinbase_serialized, coinbase_txid = create_coinbase_tx()
-# The block’s transaction list is: coinbase first, then all mempool transactions.
-all_txids = [coinbase_txid] + mempool_txids
+# Build the block's transaction list: coinbase first, then the selected mempool transactions.
+all_txids = [coinbase_txid] + selected_mempool_txids
 merkle_root = compute_merkle_root(all_txids)
 
 # -----------------------------
@@ -142,13 +173,12 @@ merkle_root = compute_merkle_root(all_txids)
 # -----------------------------
 # Block header fields:
 block_version = int_to_little_endian(0x20000000, 4)
-# Previous block hash (given value) – stored in little-endian in the header
-prev_block_hash = bytes.fromhex("0000aaaa00000000000000000000000000000000000000000000000000000000")
-# Merkle root must be in little-endian
+# Previous block hash (provided in big-endian) must be stored in little-endian in the header.
+prev_block_hash = bytes.fromhex("0000aaaa00000000000000000000000000000000000000000000000000000000")[::-1]
+# Merkle root must be in little-endian.
 merkle_root_bytes = bytes.fromhex(merkle_root)[::-1]
 timestamp = int_to_little_endian(int(time.time()), 4)
-# Bits field: must be stored in little-endian.
-# We set it to the constant 0x1f00ffff. (Avoid any accidental reversal.)
+# Bits field: constant 0x1f00ffff in little-endian.
 bits = int_to_little_endian(0x1f00ffff, 4)
 nonce = 0
 
@@ -158,12 +188,10 @@ difficulty_target = int("0000ffff00000000000000000000000000000000000000000000000
 found = False
 while not found:
     nonce_bytes = int_to_little_endian(nonce, 4)
-    # Assemble the header:
-    # Note: prev_block_hash and merkle_root are stored in little-endian (so we reverse the given big-endian values)
-    header = block_version + prev_block_hash[::-1] + merkle_root_bytes + timestamp + bits + nonce_bytes
+    # Assemble the header. Note that prev_block_hash and merkle_root_bytes are already in little-endian.
+    header = block_version + prev_block_hash + merkle_root_bytes + timestamp + bits + nonce_bytes
     header_hash = double_sha256(header)
-    # IMPORTANT: The displayed block hash is the reversed header_hash.
-    # Compare the displayed hash (interpreted as big-endian) with the difficulty target.
+    # The displayed block hash is the reversed header hash.
     displayed_hash_int = int.from_bytes(header_hash[::-1], 'big')
     if displayed_hash_int < difficulty_target:
         found = True
@@ -176,13 +204,14 @@ block_header_hex = header.hex()
 # Write out.txt File
 # -----------------------------
 with open("out.txt", "w") as f:
-    # First line: block header (80 bytes in hex)
+    # First line: Block header (80 bytes in hex)
     f.write(block_header_hex + "\n")
-    # Second line: serialized coinbase transaction
+    # Second line: Serialized coinbase transaction
     f.write(coinbase_serialized + "\n")
-    # Subsequent lines: coinbase txid followed by each mempool txid
+    # Third line: Coinbase txid
     f.write(coinbase_txid + "\n")
-    for txid in mempool_txids:
+    # Subsequent lines: each selected mempool txid
+    for txid in selected_mempool_txids:
         f.write(txid + "\n")
 
-print("Block mined and out.txt generated successfully.")
+print("Block mined and out.txt generated successfully.")
