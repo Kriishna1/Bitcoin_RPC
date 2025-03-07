@@ -134,15 +134,15 @@ for filename in os.listdir(mempool_dir):
 # We define the maximum block weight as 4,000,000 weight units.
 MAX_BLOCK_WEIGHT = 4000000
 
-# Compute coinbase weight as the byte-size of its serialized transaction (a proxy for weight).
+# Compute coinbase weight
 coinbase_serialized, coinbase_txid = create_coinbase_tx()
 coinbase_weight = len(coinbase_serialized) // 2
 
-total_weight = coinbase_weight
-selected_mempool_txids = []
+# Available weight for mempool transactions
+available_weight = MAX_BLOCK_WEIGHT - coinbase_weight
 
-# For each mempool transaction, read its JSON (which must include a "weight" field)
-# and only include it if adding its weight keeps total weight <= MAX_BLOCK_WEIGHT.
+# Store all valid mempool transactions with their weights and fees
+mempool_txs = []
 for txid in mempool_txids:
     tx_path = os.path.join(mempool_dir, f"{txid}.json")
     if os.path.exists(tx_path):
@@ -150,14 +150,33 @@ for txid in mempool_txids:
             with open(tx_path, 'r') as f:
                 tx_json = json.load(f)
                 tx_weight = int(tx_json.get("weight", 0))
-                if total_weight + tx_weight <= MAX_BLOCK_WEIGHT:
-                    total_weight += tx_weight
-                    selected_mempool_txids.append(txid)
-                else:
-                    # Skip this transaction to avoid exceeding the weight limit.
-                    continue
-        except Exception:
+                tx_fee = int(tx_json.get("fee", 0))  # Make sure your JSON has fee information
+                
+                # Only consider transactions that can fit individually
+                if tx_weight <= available_weight:
+                    mempool_txs.append({
+                        "txid": txid,
+                        "weight": tx_weight,
+                        "fee": tx_fee,
+                        "feerate": tx_fee / tx_weight  # Fee per weight unit
+                    })
+        except Exception as e:
+            # Log the exception if needed
             continue
+
+# Sort transactions by fee rate (highest first)
+mempool_txs.sort(key=lambda tx: tx["feerate"], reverse=True)
+
+# Select transactions greedily
+total_weight = coinbase_weight
+selected_mempool_txids = []
+
+for tx in mempool_txs:
+    if total_weight + tx["weight"] <= MAX_BLOCK_WEIGHT:
+        total_weight += tx["weight"]
+        selected_mempool_txids.append(tx["txid"])
+
+# Now selected_mempool_txids contains the transactions to include in the block
 
 # -----------------------------
 # Create Coinbase Transaction and Compute Merkle Root
