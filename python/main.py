@@ -46,72 +46,96 @@ def compute_merkle_root(txids: list) -> str:
     return hashes[0][::-1].hex()
 
 # -----------------------------
-# Create a Segwit Coinbase Transaction
+# Create a Segwit Coinbase Transaction with Valid Witness Commitment
 # -----------------------------
 def create_coinbase_tx() -> (str, str, str):
     """
     Create a segwit coinbase transaction.
-    
     The transaction includes:
-      - Version (4 bytes)
-      - Segwit marker (0x00) and flag (0x01)
-      - 1 input: coinbase input with prev_txid = 32 zero bytes and index = 0xffffffff,
-        a coinbase script (here, 4 bytes "abcd"), and sequence = 0xffffffff.
+      - version (4 bytes)
+      - segwit marker (0x00) and flag (0x01)
+      - 1 input: a coinbase input with prev_txid = 32 zero bytes and index = 0xffffffff,
+        a coinbase script ("abcd"), and sequence = 0xffffffff.
       - 2 outputs:
-          * Output 1: block reward (50 BTC, 5000000000 satoshis) with a simple script (OP_1)
-          * Output 2: witness commitment output (OP_RETURN with a 36-byte payload: 4-byte header "aa21a9ed" followed by 32 zero bytes)
-      - Witness: one element of length 32 (32 zero bytes)
-      - Locktime = 0
-      
+          * Output 1: Block reward (50 BTC) with a simple output script (OP_1)
+          * Output 2: Witness commitment output (value = 0) with a script that is:
+                OP_RETURN (0x6a) ||
+                OP_PUSH 36 (0x24) ||
+                4-byte header "aa21a9ed" ||
+                32-byte witness commitment
+          The witness commitment is computed as:
+                double_sha256(witness_merkle_root || witness_reserved_value)
+          For the coinbase, the witness list is [32 zero bytes] and the reserved value is 32 zero bytes.
+      - locktime = 0
     The coinbase txid is computed from the non-witness serialization.
     
     Returns:
-      - Full serialized coinbase transaction (hex)
-      - Non-witness serialization (hex)
-      - Coinbase txid (hex)
+      - full serialized coinbase transaction (hex)
+      - non-witness serialization (hex)
+      - coinbase txid (hex)
     """
-    # Version
+    # Version (4 bytes)
     version = int_to_little_endian(1, 4)
-    # Marker and flag (for segwit)
+    # Marker and flag for segwit
     marker = b'\x00'
     flag = b'\x01'
     # Input count: 1
     tx_in_count = varint(1)
-    # Coinbase input
+    # Coinbase input:
     prev_txid = b'\x00' * 32
     prev_index = (0xffffffff).to_bytes(4, 'little')
     coinbase_data = b'abcd'
     coinbase_script = varint(len(coinbase_data)) + coinbase_data
     sequence = (0xffffffff).to_bytes(4, 'little')
     tx_in = prev_txid + prev_index + coinbase_script + sequence
+
     # Output count: 2
     tx_out_count = varint(2)
-    # Output 1: Block reward output: 50 BTC
+    # Output 1: Block reward output: 50 BTC (5000000000 satoshis)
     reward = (5000000000).to_bytes(8, 'little')
     script1 = varint(1) + b'\x51'  # OP_1 is 0x51
     tx_out1 = reward + script1
+
     # Output 2: Witness commitment output: value = 0
     value2 = (0).to_bytes(8, 'little')
-    witness_commitment_data = bytes.fromhex("aa21a9ed") + (b'\x00' * 32)
-    script2 = b'\x6a' + varint(len(witness_commitment_data)) + witness_commitment_data
+    # Compute witness commitment:
+    # For the coinbase, the witness field is a single element of 32 zero bytes.
+    witness_element = b'\x00' * 32
+    # If there's one element, the witness merkle root is that element's hash (or by definition, the element itself).
+    # BIP141 actually defines the witness merkle root as the Merkle tree of the hashes of each witness item.
+    # Here we follow: leaf = sha256(witness_element)
+    leaf = hashlib.sha256(witness_element).digest()
+    witness_merkle_root = leaf  # only one element
+    # Witness reserved value is 32 zero bytes.
+    witness_reserved_value = b'\x00' * 32
+    # Compute commitment = double_sha256(witness_merkle_root || witness_reserved_value)
+    commitment = double_sha256(witness_merkle_root + witness_reserved_value)
+    # Build the witness commitment output script:
+    # It must have: OP_RETURN (0x6a) || OP_PUSH 36 (0x24) || prefix ("aa21a9ed") || commitment (32 bytes)
+    prefix = bytes.fromhex("aa21a9ed")
+    # The push data is 4 bytes prefix + 32 bytes commitment = 36 bytes, so OP_PUSH data is 0x24.
+    script2 = b'\x6a' + b'\x24' + prefix + commitment
     tx_out2 = value2 + varint(len(script2)) + script2
-    # Locktime
+
+    # Locktime (4 bytes)
     locktime = (0).to_bytes(4, 'little')
-    # Witness: one element of length 32 (32 zero bytes)
+
+    # Witness: one element with length 32 (32 zero bytes)
     witness = varint(1) + varint(32) + (b'\x00' * 32)
-    # Full transaction serialization (includes witness)
+
+    # Full segwit coinbase transaction serialization:
     coinbase_tx_full = (version + marker + flag + tx_in_count + tx_in +
                         tx_out_count + tx_out1 + tx_out2 + witness + locktime)
-    # Non-witness serialization (for txid computation)
-    coinbase_tx_non_witness = version + tx_in_count + tx_in + tx_out_count + tx_out1 + tx_out2 + locktime
-    coinbase_txid = double_sha256(coinbase_tx_non_witness)[::-1].hex()
-    return coinbase_tx_full.hex(), coinbase_tx_non_witness.hex(), coinbase_txid
+    # Non-witness serialization for txid computation:
+    coinbase_tx_nonwitness = version + tx_in_count + tx_in + tx_out_count + tx_out1 + tx_out2 + locktime
+    coinbase_txid = double_sha256(coinbase_tx_nonwitness)[::-1].hex()
+    return coinbase_tx_full.hex(), coinbase_tx_nonwitness.hex(), coinbase_txid
 
 # -----------------------------
 # Process Mempool Transactions
 # -----------------------------
 # Read all JSON files from the mempool folder.
-# Each file must be named "<txid>.json"
+# IMPORTANT: Each file in the mempool folder should be named "<txid>.json"
 mempool_dir = 'mempool'
 mempool_txids = []
 for filename in os.listdir(mempool_dir):
@@ -128,10 +152,10 @@ for filename in os.listdir(mempool_dir):
 # -----------------------------
 # Limit Mempool Transactions by Maximum Block Weight
 # -----------------------------
-# Compute coinbase weight using correct Bitcoin weight formula.
+# Correct coinbase weight calculation per Bitcoin: weight = (base_size * 3) + total_size.
 coinbase_serialized, coinbase_nonwitness, coinbase_txid = create_coinbase_tx()
-total_size = len(coinbase_serialized) // 2       # total size in bytes
-base_size = len(coinbase_nonwitness) // 2         # base size (non-witness) in bytes
+total_size = len(coinbase_serialized) // 2        # total size (witness-included) in bytes
+base_size = len(coinbase_nonwitness) // 2          # non-witness size in bytes
 coinbase_weight = base_size * 3 + total_size
 
 # Available weight for mempool transactions.
@@ -146,14 +170,13 @@ for txid in mempool_txids:
             with open(tx_path, 'r') as f:
                 tx_json = json.load(f)
                 tx_weight = int(tx_json.get("weight", 0))
-                tx_fee = int(tx_json.get("fee", 0))  # Ensure fee is available in JSON
-                # Only consider transactions that individually fit in available weight.
+                tx_fee = int(tx_json.get("fee", 0))  # Ensure fee info is present
                 if tx_weight <= available_weight:
                     mempool_txs.append({
                         "txid": txid,
                         "weight": tx_weight,
                         "fee": tx_fee,
-                        "feerate": tx_fee / tx_weight if tx_weight > 0 else 0
+                        "feerate": tx_fee / tx_weight if tx_weight else 0
                     })
         except Exception:
             continue
@@ -161,7 +184,7 @@ for txid in mempool_txids:
 # Sort transactions by fee rate (highest first).
 mempool_txs.sort(key=lambda tx: tx["feerate"], reverse=True)
 
-# Greedily select transactions while keeping total weight ≤ MAX_BLOCK_WEIGHT.
+# Greedily select transactions while keeping total weight within limit.
 total_weight = coinbase_weight
 selected_mempool = []
 for tx in mempool_txs:
@@ -169,7 +192,7 @@ for tx in mempool_txs:
         selected_mempool.append(tx)
         total_weight += tx["weight"]
 
-# Ensure total weight does not exceed the limit.
+# Remove last-added transactions if over the limit.
 while total_weight > MAX_BLOCK_WEIGHT and selected_mempool:
     removed = selected_mempool.pop()
     total_weight -= removed["weight"]
@@ -179,9 +202,9 @@ selected_mempool_txids = [tx["txid"] for tx in selected_mempool]
 # -----------------------------
 # Create Coinbase Transaction and Compute Merkle Root
 # -----------------------------
-# Recreate coinbase transaction (if needed).
+# Recreate coinbase transaction (if necessary).
 coinbase_serialized, coinbase_nonwitness, coinbase_txid = create_coinbase_tx()
-# Build block transaction list: coinbase first, then selected mempool transactions.
+# Block transaction list: coinbase first, then selected mempool transactions.
 all_txids = [coinbase_txid] + selected_mempool_txids
 merkle_root = compute_merkle_root(all_txids)
 
@@ -194,9 +217,10 @@ prev_block_hash = bytes.fromhex("0000aaaa000000000000000000000000000000000000000
 # Merkle root must be in little-endian.
 merkle_root_bytes = bytes.fromhex(merkle_root)[::-1]
 timestamp = int_to_little_endian(int(time.time()), 4)
-# Bits field: constant 0x1f00ffff in little-endian.
+# Bits: constant 0x1f00ffff stored in little-endian.
 bits = int_to_little_endian(0x1f00ffff, 4)
 nonce = 0
+
 difficulty_target = int("0000ffff00000000000000000000000000000000000000000000000000000000", 16)
 
 found = False
@@ -204,7 +228,6 @@ while not found:
     nonce_bytes = int_to_little_endian(nonce, 4)
     header = block_version + prev_block_hash + merkle_root_bytes + timestamp + bits + nonce_bytes
     header_hash = double_sha256(header)
-    # The displayed block hash is the reversed header hash.
     displayed_hash_int = int.from_bytes(header_hash[::-1], 'big')
     if displayed_hash_int < difficulty_target:
         found = True
@@ -217,13 +240,9 @@ block_header_hex = header.hex()
 # Write out.txt File
 # -----------------------------
 with open("out.txt", "w") as f:
-    # First line: block header (80 bytes in hex)
     f.write(block_header_hex + "\n")
-    # Second line: serialized coinbase transaction
     f.write(coinbase_serialized + "\n")
-    # Third line: coinbase txid
     f.write(coinbase_txid + "\n")
-    # Subsequent lines: each selected mempool txid
     for txid in selected_mempool_txids:
         f.write(txid + "\n")
 
