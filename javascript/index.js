@@ -4,27 +4,35 @@ const crypto = require('crypto');
 const bitcoin = require('bitcoinjs-lib');
 
 // -----------------------------
-// Helper Functions (inlined)
+// Helper Functions
 // -----------------------------
 
-// Difficulty target (provided)
+// Difficulty target (as given, in hex)
 const DIFFICULTY = Buffer.from('0000ffff00000000000000000000000000000000000000000000000000000000', 'hex');
 // Witness reserved value: 32 zero bytes.
 const WITNESS_RESERVED_VALUE = Buffer.alloc(32, 0);
 
-// double_sha256: returns a Buffer.
+// double_sha256: compute double SHA256 (input: Buffer, output: Buffer)
 function double_sha256(data) {
   const h1 = crypto.createHash('sha256').update(data).digest();
   return crypto.createHash('sha256').update(h1).digest();
 }
 
-// hash256: double SHA256; input as hex string, output as hex string.
+// hash256: double SHA256 but return a hex string.
+// Input: hex string, Output: hex string.
 function hash256(inputHex) {
   const h1 = crypto.createHash('sha256').update(Buffer.from(inputHex, 'hex')).digest();
   return crypto.createHash('sha256').update(h1).digest('hex');
 }
 
-// intToLE: convert integer to little-endian Buffer.
+// computeWtxid: given a full transaction hex, compute its wtxid by hashing and reversing the bytes.
+function computeWtxid(fullHex) {
+  const hexHash = hash256(fullHex);
+  // Reverse byte order: split into 2-char groups, reverse, join.
+  return hexHash.match(/.{2}/g).reverse().join('');
+}
+
+// intToLE: convert an integer to a little-endian Buffer of given length.
 function intToLE(num, bytes) {
   const buf = Buffer.alloc(bytes);
   buf.writeUIntLE(num, 0, bytes);
@@ -39,7 +47,7 @@ function varint(n) {
   else return Buffer.concat([Buffer.from([0xff]), intToLE(n, 8)]);
 }
 
-// generateMerkleRoot: compute merkle root from an array of hex strings.
+// generateMerkleRoot: compute Merkle root from an array of hex strings.
 function generateMerkleRoot(txids) {
   if (txids.length === 0) return '00'.repeat(32);
   let level = txids.map(txid => Buffer.from(txid, 'hex').reverse().toString('hex'));
@@ -50,7 +58,7 @@ function generateMerkleRoot(txids) {
       if (i + 1 === level.length) {
         pair = level[i] + level[i];
       } else {
-        pair = level[i] + level[i+1];
+        pair = level[i] + level[i + 1];
       }
       const h1 = crypto.createHash('sha256').update(Buffer.from(pair, 'hex')).digest();
       const h2 = crypto.createHash('sha256').update(h1).digest();
@@ -61,28 +69,14 @@ function generateMerkleRoot(txids) {
   return level[0];
 }
 
-// calculateWitnessCommitment: witness commitment = hash256(witnessMerkleRoot || witnessReservedValue)
-function calculateWitnessCommitment(wtxids) {
-  const witnessRoot = generateMerkleRoot(wtxids);
-  const reservedHex = WITNESS_RESERVED_VALUE.toString('hex');
-  return hash256(witnessRoot + reservedHex);
-}
+// -----------------------------
+// Coinbase Transaction Creation Functions
+// -----------------------------
 
-// -----------------------------
-// Coinbase Transaction Creation
-// -----------------------------
-/*
-  createCoinbaseTxWithCommitment(commitment)
-    Builds a coinbase transaction with:
-    - One input (coinbase) with coinbase data "abcd".
-    - Two outputs:
-        * Output 1: block reward (50 BTC) with a simple script (OP_1).
-        * Output 2: Witness commitment output with script:
-            OP_RETURN (0x6a) || OP_PUSHBYTES_36 (0x24) || 0xaa21a9ed || [commitment]
-    - The witness for the coinbase input is initially empty (for dummy creation).
-    Returns:
-      { full, nonWitness, txid }
-*/
+// createCoinbaseTxWithCommitment(commitment):
+// Builds a coinbase transaction where the second output's script is:
+//   OP_RETURN (0x6a) || OP_PUSHBYTES_36 (0x24) || 0xaa21a9ed || [commitment]
+// Initially, we create it with an empty witness.
 function createCoinbaseTxWithCommitment(commitment) {
   const version = intToLE(1, 4);
   const marker = Buffer.from([0x00]);
@@ -96,20 +90,20 @@ function createCoinbaseTxWithCommitment(commitment) {
   const txIn = Buffer.concat([prevTxid, prevIndex, coinbaseScript, sequence]);
   
   const txOutCount = varint(2);
-  // Output 1: block reward (50 BTC)
+  // Output 1: block reward: 50 BTC
   const reward = intToLE(5000000000, 8);
   const script1 = Buffer.concat([varint(1), Buffer.from([0x51])]); // OP_1
   const txOut1 = Buffer.concat([reward, varint(script1.length), script1]);
   
   // Output 2: Witness commitment output.
-  // Build script: OP_RETURN (0x6a) || OP_PUSHBYTES_36 (0x24) || prefix (0xaa21a9ed) || commitment
+  // Build script: OP_RETURN (0x6a) || OP_PUSHBYTES_36 (0x24) || prefix ("aa21a9ed") || [commitment]
   const value2 = intToLE(0, 8);
   const prefix = Buffer.from("aa21a9ed", "hex");
   const script2 = Buffer.concat([Buffer.from([0x6a, 0x24]), prefix, commitment]);
   const txOut2 = Buffer.concat([value2, varint(script2.length), script2]);
   
   const locktime = intToLE(0, 4);
-  // Initially, set witness to empty (we will later update it)
+  // Initially set witness to empty (we'll update it later)
   const witness = Buffer.concat([varint(0)]);
   
   const fullTx = Buffer.concat([version, marker, flag, txInCount, txIn, txOutCount, txOut1, txOut2, witness, locktime]);
@@ -119,11 +113,9 @@ function createCoinbaseTxWithCommitment(commitment) {
   return { full: fullTx.toString('hex'), nonWitness: nonWitnessTx.toString('hex'), txid };
 }
 
-/*
-  updateCoinbaseTx(commitment):
-    Rebuilds the coinbase transaction with the valid witness commitment output,
-    and sets the coinbase witness stack to contain the reserved value (32 zero bytes).
-*/
+// updateCoinbaseTx(commitment):
+// Rebuilds the coinbase transaction with the correct witness commitment output script
+// and sets the coinbase witness stack to [reserved value] (32 zero bytes).
 function updateCoinbaseTx(commitment) {
   const version = intToLE(1, 4);
   const marker = Buffer.from([0x00]);
@@ -141,14 +133,14 @@ function updateCoinbaseTx(commitment) {
   const script1 = Buffer.concat([varint(1), Buffer.from([0x51])]);
   const txOut1 = Buffer.concat([reward, varint(script1.length), script1]);
   
-  // New Output 2: Witness commitment output with our computed commitment.
+  // New Output 2 with valid witness commitment:
   const value2 = intToLE(0, 8);
   const prefix = Buffer.from("aa21a9ed", "hex");
   const script2 = Buffer.concat([Buffer.from([0x6a, 0x24]), prefix, commitment]);
   const txOut2 = Buffer.concat([value2, varint(script2.length), script2]);
   
   const locktime = intToLE(0, 4);
-  // Now, set witness stack to contain the reserved value (32 zeros)
+  // Set witness stack to contain the reserved value (32 zero bytes)
   const witness = Buffer.concat([varint(1), varint(32), Buffer.alloc(32, 0)]);
   
   const fullTx = Buffer.concat([version, marker, flag, txInCount, txIn, txOutCount, txOut1, txOut2, witness, locktime]);
@@ -182,14 +174,14 @@ fs.readdirSync(mempoolDir).forEach(file => {
 // -----------------------------
 // Limit Mempool Transactions by Maximum Block Weight
 // -----------------------------
-// Calculate coinbase weight using Bitcoin formula: weight = (base size * 3) + total size.
+const MAX_BLOCK_WEIGHT = 4000000;
+// Calculate coinbase weight using Bitcoin weight formula: weight = (base_size * 3) + total_size.
 const coinbaseDummy = createCoinbaseTxWithCommitment(Buffer.alloc(32, 0));
 const totalSize = coinbaseDummy.full.length / 2;
 const baseSize = coinbaseDummy.nonWitness.length / 2;
 const coinbaseWeight = baseSize * 3 + totalSize;
 const availableWeight = MAX_BLOCK_WEIGHT - coinbaseWeight;
 
-// Gather mempool transactions (each JSON must include "weight", "fee", and "hex").
 let mempoolTxs = [];
 mempoolTxids.forEach(txid => {
   const txPath = path.join(mempoolDir, `${txid}.json`);
@@ -230,31 +222,32 @@ const selectedMempoolTxids = selectedMempool.map(tx => tx.txid);
 // -----------------------------
 // Witness Commitment Calculation Flow
 // -----------------------------
-// Step 1: Compute wtxids.
-// For coinbase, wtxid is defined as 32 zero bytes.
-const coinbaseWtxid = "00".repeat(32);
+// Step 1: Compute wtxids for all transactions.
+// For coinbase, per BIP141, use 32 zero bytes.
+const coinbaseWtxid = Buffer.alloc(32, 0).toString('hex');
 let wtxids = [coinbaseWtxid];
 for (const tx of selectedMempool) {
-  const fullHex = tx.hex;
+  const fullHex = mempoolTxHexes[tx.txid];
   if (fullHex) {
-    const wtxid = double_sha256(Buffer.from(fullHex, 'hex')).reverse().toString('hex');
+    // Compute wtxid: double_sha256(fullHex) and then reverse the byte order.
+    const wtxid = hash256(fullHex).match(/.{2}/g).reverse().join('');
     wtxids.push(wtxid);
   }
 }
 
-// Step 2: Compute witness merkle root from wtxids.
+// Step 2: Compute witness merkle root from the wtxids.
 const witnessMerkleRoot = generateMerkleRoot(wtxids);
 
-// Step 3: Witness commitment input = witnessMerkleRoot || witness_reserved_value (32 zeros)
-const witnessReservedValueHex = "00".repeat(32);
+// Step 3: Build witness commitment input = witnessMerkleRoot || witness_reserved_value (32 zeros)
+const witnessReservedValueHex = Buffer.alloc(32, 0).toString('hex');
 const witnessCommitmentInput = witnessMerkleRoot + witnessReservedValueHex;
 
-// Step 4: Compute witness commitment = hash256(witnessCommitmentInput)
+// Step 4: Compute final witness commitment = hash256(witnessCommitmentInput)
 const witnessCommitmentHex = hash256(witnessCommitmentInput);
 const witnessCommitment = Buffer.from(witnessCommitmentHex, 'hex');
 
 // -----------------------------
-// Rebuild Coinbase Transaction with Valid Witness Commitment
+// Rebuild the Coinbase Transaction with Valid Witness Commitment
 // -----------------------------
 const updatedCoinbase = updateCoinbaseTx(witnessCommitment);
 const coinbaseFull = updatedCoinbase.full;
